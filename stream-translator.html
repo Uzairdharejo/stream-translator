@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Stream Translator</title>
+<style>
+/* Layout: one column, language chips on top, big listen button, English log below */
+:root{
+  --bg:#f3f5f7; --panel:#ffffff; --fg:#14202b; --muted:#5d6c7a; --line:#d8dfe5;
+  --accent:#0b6e63; --accent-fg:#ffffff; --live:#c2410c; --orig:#44525f;
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){
+  :root{--bg:#0e1418; --panel:#161e24; --fg:#e8eef2; --muted:#93a3b1; --line:#27323b; --accent:#2fbfa9; --accent-fg:#06201b; --live:#fb923c; --orig:#a9b6c1; color-scheme:dark}
+}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%}
+body{background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  padding-block:max(16px,env(safe-area-inset-top)) max(24px,env(safe-area-inset-bottom));
+  padding-left:max(16px,env(safe-area-inset-left));padding-right:max(16px,env(safe-area-inset-right))}
+main{max-width:640px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+h1{font-size:1.25rem;margin:0;letter-spacing:.01em}
+.sub{color:var(--muted);font-size:.9rem;margin:2px 0 0}
+.langs{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.langs button{min-width:0;padding:12px 4px;border:1px solid var(--line);background:var(--panel);color:var(--fg);
+  border-radius:10px;font:inherit;font-size:.9rem;cursor:pointer}
+.langs button[aria-pressed="true"]{background:var(--accent);color:var(--accent-fg);border-color:var(--accent);font-weight:600}
+.langs small{display:block;opacity:.75;font-size:.72rem}
+#go{width:100%;padding:18px;border:0;border-radius:14px;background:var(--accent);color:var(--accent-fg);
+  font:inherit;font-size:1.15rem;font-weight:700;cursor:pointer}
+#go.on{background:var(--live);color:#fff}
+.row{display:flex;gap:16px;flex-wrap:wrap;align-items:center;color:var(--muted);font-size:.92rem}
+.row label{display:flex;gap:8px;align-items:center;cursor:pointer}
+.row input[type=checkbox]{width:20px;height:20px;accent-color:var(--accent)}
+#status{min-height:1.4em;font-size:.9rem;color:var(--muted)}
+#status.err{color:var(--live)}
+.live{background:var(--panel);border:1px dashed var(--line);border-radius:12px;padding:12px 14px;min-height:3.2em;color:var(--orig);overflow-wrap:anywhere}
+.live:empty::before{content:"Heard speech appears here as it is recognised";color:var(--muted)}
+#log{display:flex;flex-direction:column;gap:10px;margin:0;padding:0;list-style:none}
+#log li{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px;min-width:0}
+.en{font-size:1.08rem;overflow-wrap:anywhere}
+.src{margin-top:4px;font-size:.85rem;color:var(--muted);overflow-wrap:anywhere}
+.tag{font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);font-weight:700;margin-right:6px}
+:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+@media (prefers-reduced-motion:no-preference){#go{transition:background .15s}}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Stream Translator</h1>
+    <p class="sub">Plays the stream on another screen. Your phone listens and tells you in English through your earbuds.</p>
+  </header>
+
+  <div class="langs" id="langs" role="group" aria-label="Language being spoken in the stream"></div>
+
+  <button id="go" type="button">Start listening</button>
+  <div id="status" role="status" aria-live="polite"></div>
+
+  <div class="row">
+    <label><input type="checkbox" id="speak" checked> Speak English in my earbuds</label>
+    <label><input type="checkbox" id="wake" checked> Keep screen on</label>
+  </div>
+
+  <div class="live" id="live" aria-label="Live recognised speech"></div>
+  <ol id="log" aria-label="Translations"></ol>
+</main>
+
+<script>
+(function(){
+  var LANGS=[
+    {code:"de",bcp:"de-DE",name:"German",native:"Deutsch"},
+    {code:"es",bcp:"es-ES",name:"Spanish",native:"Español"},
+    {code:"fr",bcp:"fr-FR",name:"French",native:"Français"},
+    {code:"ja",bcp:"ja-JP",name:"Japanese",native:"日本語"}
+  ];
+  var cur=LANGS[0], rec=null, running=false, wakeLock=null, gotResult=false;
+  var $=function(id){return document.getElementById(id)};
+  var go=$("go"), statusEl=$("status"), live=$("live"), log=$("log");
+
+  try{var saved=localStorage.getItem("st-lang");if(saved){cur=LANGS.filter(function(l){return l.code===saved})[0]||cur}}catch(e){}
+
+  function setStatus(t,err){statusEl.textContent=t;statusEl.className=err?"err":""}
+
+  var langBox=$("langs");
+  LANGS.forEach(function(l){
+    var b=document.createElement("button");b.type="button";b.dataset.code=l.code;
+    b.innerHTML=l.name+"<small>"+l.native+"</small>";
+    b.addEventListener("click",function(){choose(l)});
+    langBox.appendChild(b);
+  });
+  function paint(){Array.prototype.forEach.call(langBox.children,function(b){b.setAttribute("aria-pressed",b.dataset.code===cur.code?"true":"false")})}
+  function choose(l){
+    cur=l;try{localStorage.setItem("st-lang",l.code)}catch(e){}
+    paint();
+    if(running){stopRec();startRec()}
+  }
+  paint();
+
+  var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!SR){
+    go.disabled=true;
+    setStatus("This browser can't listen to speech. Open this page in Chrome on Android, or Safari on iPhone.",true);
+  }
+
+  function translate(text,from){
+    var url="https://api.mymemory.translated.net/get?q="+encodeURIComponent(text)+"&langpair="+from+"|en";
+    return fetch(url).then(function(r){if(!r.ok)throw new Error("net");return r.json()}).then(function(j){
+      var t=j&&j.responseData&&j.responseData.translatedText;
+      if(!t)throw new Error("empty");
+      var d=document.createElement("textarea");d.innerHTML=t;return d.value;
+    });
+  }
+
+  function say(text){
+    if(!$("speak").checked||!window.speechSynthesis)return;
+    if(speechSynthesis.pending){speechSynthesis.cancel()}
+    var u=new SpeechSynthesisUtterance(text);u.lang="en-US";u.rate=1.05;
+    speechSynthesis.speak(u);
+  }
+
+  function addLine(src,lang){
+    var li=document.createElement("li");
+    var en=document.createElement("div");en.className="en";en.textContent="…";
+    var s=document.createElement("div");s.className="src";
+    var tag=document.createElement("span");tag.className="tag";tag.textContent=lang.code;
+    s.appendChild(tag);s.appendChild(document.createTextNode(src));
+    li.appendChild(en);li.appendChild(s);
+    log.insertBefore(li,log.firstChild);
+    while(log.children.length>40)log.removeChild(log.lastChild);
+    translate(src,lang.code).then(function(t){en.textContent=t;say(t)})
+      .catch(function(){en.textContent="Translation failed. Check your internet connection.";en.style.color="var(--live)"});
+  }
+
+  function startRec(){
+    rec=new SR();rec.lang=cur.bcp;rec.continuous=true;rec.interimResults=true;
+    var lang=cur;
+    rec.onresult=function(e){
+      gotResult=true;var interim="";
+      for(var i=e.resultIndex;i<e.results.length;i++){
+        var r=e.results[i],t=r[0].transcript.trim();
+        if(r.isFinal){if(t)addLine(t,lang);live.textContent=""}
+        else interim+=t+" ";
+      }
+      if(interim)live.textContent=interim;
+    };
+    rec.onerror=function(e){
+      if(e.error==="not-allowed"||e.error==="service-not-allowed"){
+        running=false;ui();
+        setStatus("Microphone is blocked. Allow the microphone for this page in your browser settings. The page must be opened from an https link.",true);
+      }else if(e.error==="network"){
+        setStatus("Speech recognition needs an internet connection.",true);
+      }
+    };
+    rec.onend=function(){
+      if(running){try{rec.start()}catch(e){setTimeout(function(){if(running)startRec()},400)}}
+    };
+    try{rec.start();setStatus("Listening for "+lang.name+"…")}catch(e){setStatus("Could not start. Tap Start again.",true)}
+  }
+  function stopRec(){
+    var r=rec;rec=null;
+    if(r){r.onend=null;try{r.abort()}catch(e){}}
+  }
+
+  function ui(){
+    go.textContent=running?"Stop":"Start listening";
+    go.className=running?"on":"";
+    go.setAttribute("aria-pressed",running?"true":"false");
+  }
+
+  function lock(){
+    if(!$("wake").checked||!navigator.wakeLock)return;
+    navigator.wakeLock.request("screen").then(function(l){wakeLock=l}).catch(function(){});
+  }
+  function unlock(){if(wakeLock){try{wakeLock.release()}catch(e){}wakeLock=null}}
+  document.addEventListener("visibilitychange",function(){if(running&&document.visibilityState==="visible")lock()});
+
+  go.addEventListener("click",function(){
+    running=!running;ui();
+    if(running){
+      // speech output must be started by a tap on iOS and Android
+      if(window.speechSynthesis){var u=new SpeechSynthesisUtterance(" ");speechSynthesis.speak(u)}
+      lock();startRec();
+    }else{
+      stopRec();unlock();if(window.speechSynthesis)speechSynthesis.cancel();
+      live.textContent="";setStatus("Stopped.");
+    }
+  });
+})();
+</script>
+</body>
+</html>
